@@ -495,3 +495,125 @@ def compute_thevenin(elements: list[Element], nodes: list[int],
         'il': il, 'il_unit': 'A',
         'pl': pl, 'pl_unit': 'W',
     }
+
+
+# 单电阻断路定位的测点数量上限（与非接地节点数上限一致）
+MAX_MEASUREMENTS = MAX_NODES
+
+
+def _validate_measurements(measurements: list[dict],
+                           nodes: list[int]) -> list[dict]:
+    """校验测点列表，返回规范化后的 [{'node', 'voltage', 'tolerance'}]。"""
+    if not 1 <= len(measurements) <= MAX_MEASUREMENTS:
+        raise NetlistError(
+            f'测点数量为 {len(measurements)} 条，'
+            f'应为 1～{MAX_MEASUREMENTS} 条不重复的非接地节点实测电压')
+    seen = set()
+    checked = []
+    for i, m in enumerate(measurements, 1):
+        node, voltage, tol = m['node'], m['voltage'], m['tolerance']
+        if node == GROUND:
+            raise NetlistError(
+                f'第 {i} 条测点：节点 0 为接地节点，电压恒为 0，不能作为测点')
+        if node not in nodes:
+            raise NetlistError(
+                f'第 {i} 条测点：节点 {node} 不存在：当前网表的非接地节点为 '
+                f'{"、".join(map(str, nodes))}')
+        if node in seen:
+            raise NetlistError(f'第 {i} 条测点：节点 {node} 与前面的测点重复')
+        seen.add(node)
+        if not math.isfinite(voltage):
+            raise NetlistError(
+                f'第 {i} 条测点：实测电压必须为有限值（当前为 {voltage}，单位 V）')
+        if not math.isfinite(tol) or tol <= 0:
+            raise NetlistError(
+                f'第 {i} 条测点：容差必须为正的有限值（当前为 {tol}，单位 V）')
+        checked.append({'node': node, 'voltage': voltage, 'tolerance': tol})
+    return checked
+
+
+def diagnose_open(elements: list[Element], nodes: list[int],
+                  measurements: list[dict]) -> dict:
+    """单电阻断路定位：枚举「正常电路」与「每个电阻单独断路」的假设。
+
+    measurements 为 [{'node': 非接地节点, 'voltage': 实测电压,
+    'tolerance': 绝对容差}]（1～12 条、节点不重复、电压有限、容差为正的
+    有限值，单位均为 V）。
+
+    断路即删除该电阻支路，保留原节点集合重新组装 MNA（不以大电阻近似）。
+    正常电路必须有唯一解，否则抛出 NoUniqueSolutionError；断路后无唯一解的
+    假设记录原因（solvable=False）后继续检查其余假设。
+
+    每个可求解假设的得分为各测点 |预测 − 实测| ÷ 容差 的最大值，≤ 1 为匹配。
+    返回 {'results', 'matches', 'conclusion'}：results 中可求解假设按
+    （得分, 假设名称）排序，无唯一解的假设按名称排在最后；conclusion 的
+    type 为 normal（仅正常电路匹配）/ open（仅某电阻断路匹配）/
+    ambiguous（多个匹配，无法区分）/ none（无匹配，不符合单断路模型）。
+    """
+    checked = _validate_measurements(measurements, nodes)
+
+    # 正常电路必须有唯一解，否则诊断前提不成立
+    _solve_mna(elements, nodes)
+
+    hypotheses = [('正常电路', None, elements)]
+    for r in elements:
+        if r.kind == 'R':
+            hypotheses.append(
+                (f'{r.name} 断路', r.name, [e for e in elements if e is not r]))
+
+    solvable = []
+    unsolvable = []
+    for name, open_element, variant in hypotheses:
+        try:
+            x, _, index, _ = _solve_mna(variant, nodes)
+        except NoUniqueSolutionError as exc:
+            unsolvable.append({
+                'hypothesis': name, 'element': open_element,
+                'solvable': False, 'reason': str(exc),
+            })
+            continue
+        predictions = []
+        score = 0.0
+        for m in checked:
+            predicted = x[index[m['node']]]
+            error = predicted - m['voltage']
+            ratio = abs(error) / m['tolerance']
+            score = max(score, ratio)
+            predictions.append({
+                'node': m['node'],
+                'measured': m['voltage'],
+                'predicted': predicted,
+                'error': error,
+                'tolerance': m['tolerance'],
+                'ratio': ratio,
+            })
+        solvable.append({
+            'hypothesis': name, 'element': open_element,
+            'solvable': True, 'predictions': predictions,
+            'score': score, 'matched': score <= 1.0,
+        })
+
+    solvable.sort(key=lambda r: (r['score'], r['hypothesis']))
+    unsolvable.sort(key=lambda r: r['hypothesis'])
+    matched = [r for r in solvable if r['matched']]
+
+    if len(matched) == 1:
+        only = matched[0]
+        conclusion = {
+            'type': 'normal' if only['element'] is None else 'open',
+            'hypothesis': only['hypothesis'],
+            'element': only['element'],
+        }
+    elif matched:
+        conclusion = {
+            'type': 'ambiguous',
+            'candidates': [r['hypothesis'] for r in matched],
+        }
+    else:
+        conclusion = {'type': 'none'}
+
+    return {
+        'results': solvable + unsolvable,
+        'matches': [r['hypothesis'] for r in matched],
+        'conclusion': conclusion,
+    }

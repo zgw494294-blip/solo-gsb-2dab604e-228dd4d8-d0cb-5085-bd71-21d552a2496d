@@ -46,7 +46,8 @@ sys.modules['numpy'] = fake_np
 
 import solver  # noqa: E402
 from solver import (NetlistError, NoUniqueSolutionError, compute_sensitivity,  # noqa: E402
-                    compute_thevenin, parse_netlist, solve_circuit)
+                    compute_thevenin, diagnose_open, parse_netlist,
+                    solve_circuit)
 
 # ---------- 测试工具 ----------
 PASSED = 0
@@ -417,6 +418,132 @@ except NoUniqueSolutionError as exc:
     check('悬浮' in str(exc), f'戴维南：无唯一解网表沿用原反馈 -> {exc}')
 else:
     check(False, '戴维南：无唯一解时未抛出 NoUniqueSolutionError')
+
+# ---------- 单电阻断路定位 ----------
+print('== 单电阻断路定位 ==')
+
+
+def diag_text(text, measurements):
+    elements, nodes = parse_netlist(text)
+    return diagnose_open(elements, nodes, measurements)
+
+
+def results_by_name(result):
+    return {r['hypothesis']: r for r in result['results']}
+
+
+# 分压电路 DIV：正常 V(2)=5；R1 断路 V(2)=0；R2 断路 V(2)=10
+r = diag_text(DIV, [{'node': 2, 'voltage': 5.0, 'tolerance': 0.1}])
+d = results_by_name(r)
+check(r['conclusion']['type'] == 'normal'
+      and r['conclusion']['hypothesis'] == '正常电路',
+      '断路定位：实测符合正常电路时结论为正常')
+check(d['正常电路']['matched'] and close(d['正常电路']['score'], 0),
+      '断路定位：正常假设得分 0 且匹配')
+check(not d['R1 断路']['matched'] and close(d['R1 断路']['score'], 50)
+      and not d['R2 断路']['matched']
+      and close(d['R2 断路']['score'], 50),
+      '断路定位：不匹配的断路假设得分 > 1')
+check(r['matches'] == ['正常电路'], '断路定位：matches 仅含匹配假设')
+check(r['results'][0]['hypothesis'] == '正常电路',
+      '断路定位：结果按得分升序排列')
+
+# 带符号误差：R1 断路预测 V(2)=0，实测 5 → 误差 = 预测 − 实测 = −5
+pred = d['R1 断路']['predictions'][0]
+check(pred['node'] == 2 and close(pred['predicted'], 0)
+      and close(pred['error'], -5) and close(pred['measured'], 5)
+      and close(pred['tolerance'], 0.1) and close(pred['ratio'], 50),
+      '断路定位：预测值、带符号误差与容差')
+
+# R1 断路：实测 V(2)=0 → 仅「R1 断路」匹配
+r = diag_text(DIV, [{'node': 2, 'voltage': 0.0, 'tolerance': 0.1}])
+check(r['conclusion']['type'] == 'open'
+      and r['conclusion']['element'] == 'R1',
+      '断路定位：实测符合 R1 断路时指出断路元件')
+
+# 断路后无唯一解的假设单列原因，其余假设继续检查
+NET3 = 'V1 1 0 10\nR1 1 2 5\nR2 2 0 5\nR3 2 3 8'
+r = diag_text(NET3, [{'node': 2, 'voltage': 5.0, 'tolerance': 0.1}])
+d = results_by_name(r)
+check(not d['R3 断路']['solvable'] and '悬浮' in d['R3 断路']['reason'],
+      '断路定位：断路后悬浮的假设单列原因')
+check(d['正常电路']['solvable'] and d['R1 断路']['solvable']
+      and d['R2 断路']['solvable'],
+      '断路定位：无唯一解假设不影响其余假设求解')
+check(r['conclusion']['type'] == 'normal',
+      '断路定位：含不可求解假设时仍能得出正常结论')
+check(r['results'][-1]['hypothesis'] == 'R3 断路',
+      '断路定位：无唯一解的假设排在结果最后')
+
+# 测点被电压源钳位：所有假设预测一致 → 多个匹配，无法区分
+r = diag_text(DIV, [{'node': 1, 'voltage': 10.0, 'tolerance': 0.1}])
+check(r['conclusion']['type'] == 'ambiguous'
+      and len(r['conclusion']['candidates']) == 3,
+      '断路定位：多个假设同时匹配时提示无法区分')
+check([x['hypothesis'] for x in r['results']]
+      == ['R1 断路', 'R2 断路', '正常电路'],
+      '断路定位：得分相同按假设名称排序')
+
+# 实测值与任何假设都不符 → 不符合单断路模型
+r = diag_text(DIV, [{'node': 2, 'voltage': 3.0, 'tolerance': 0.1}])
+check(r['conclusion']['type'] == 'none' and r['matches'] == [],
+      '断路定位：无匹配时说明不符合单断路模型')
+
+# 多测点：得分取各测点 |误差|/容差 的最大值
+r = diag_text(DIV, [{'node': 1, 'voltage': 10.05, 'tolerance': 0.1},
+                    {'node': 2, 'voltage': 5.0, 'tolerance': 0.1}])
+d = results_by_name(r)
+check(close(d['正常电路']['score'], 0.5)
+      and r['conclusion']['type'] == 'normal',
+      '断路定位：多测点得分取最大归一化误差')
+
+# 得分决定排序：正常 0.1、R1 断路 4.9、R2 断路 5.1
+r = diag_text(DIV, [{'node': 2, 'voltage': 4.9, 'tolerance': 1.0}])
+check([x['hypothesis'] for x in r['results']]
+      == ['正常电路', 'R1 断路', 'R2 断路'],
+      '断路定位：可求解假设按得分升序排列')
+
+# 无电阻的网表：仅枚举正常电路
+r = diag_text('V1 1 0 4\nI1 0 1 0.5', [{'node': 1, 'voltage': 4.0,
+                                        'tolerance': 0.1}])
+check(len(r['results']) == 1 and r['conclusion']['type'] == 'normal',
+      '断路定位：无电阻网表只检查正常电路')
+
+
+def expect_diag_error(text, measurements, keyword, label,
+                      exc_type=NetlistError):
+    try:
+        diag_text(text, measurements)
+    except exc_type as exc:
+        check(keyword in str(exc), f'{label}（提示包含「{keyword}」）-> {exc}')
+        return
+    except Exception as exc:  # noqa: BLE001
+        check(False, f'{label}（抛出了错误类型 {type(exc).__name__}: {exc}）')
+        return
+    check(False, f'{label}（未抛出 {exc_type.__name__}）')
+
+
+M = lambda n, v, t: {'node': n, 'voltage': v, 'tolerance': t}  # noqa: E731
+expect_diag_error(DIV, [], '1～12', '断路定位：测点数量为 0')
+expect_diag_error(DIV, [M(1, 1, 1)] * 13, '1～12', '断路定位：测点超过 12 条')
+expect_diag_error(DIV, [M(0, 0, 1)], '接地', '断路定位：测点为接地节点')
+expect_diag_error(DIV, [M(7, 1, 1)], '不存在', '断路定位：测点节点不存在')
+expect_diag_error(DIV, [M(2, 5, 1), M(2, 5, 1)], '重复',
+                  '断路定位：测点节点重复')
+expect_diag_error(DIV, [M(2, 5, 0)], '正的有限', '断路定位：零容差')
+expect_diag_error(DIV, [M(2, 5, -0.1)], '正的有限', '断路定位：负容差')
+expect_diag_error(DIV, [M(2, 5, float('nan'))], '正的有限',
+                  '断路定位：NaN 容差')
+expect_diag_error(DIV, [M(2, 5, float('inf'))], '正的有限',
+                  '断路定位：无穷容差')
+expect_diag_error(DIV, [M(2, float('inf'), 1)], '有限',
+                  '断路定位：无穷实测电压')
+expect_diag_error(DIV, [M(2, float('nan'), 1)], '有限',
+                  '断路定位：NaN 实测电压')
+
+# 正常电路无唯一解时诊断前提不成立，直接报错
+expect_diag_error('I1 1 0 1', [M(1, 1, 1)], '悬浮',
+                  '断路定位：正常电路无唯一解', NoUniqueSolutionError)
 
 print(f'\n通过 {PASSED} 项，失败 {FAILED} 项')
 sys.exit(1 if FAILED else 0)
