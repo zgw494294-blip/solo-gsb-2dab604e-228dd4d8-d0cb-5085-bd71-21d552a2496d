@@ -46,7 +46,8 @@ sys.modules['numpy'] = fake_np
 
 import solver  # noqa: E402
 from solver import (NetlistError, NoUniqueSolutionError, compute_sensitivity,  # noqa: E402
-                    compute_thevenin, parse_netlist, solve_circuit)
+                    compute_thevenin, diagnose_open, parse_netlist,
+                    solve_circuit)
 
 # ---------- 测试工具 ----------
 PASSED = 0
@@ -417,6 +418,116 @@ except NoUniqueSolutionError as exc:
     check('悬浮' in str(exc), f'戴维南：无唯一解网表沿用原反馈 -> {exc}')
 else:
     check(False, '戴维南：无唯一解时未抛出 NoUniqueSolutionError')
+
+# ---------- 单电阻断路定位 ----------
+print('== 单电阻断路定位 ==')
+
+# T 型电路：正常 V(1)=10、V(2)=V(3)=5；R1 断路 V(2)=V(3)=0；
+# R2 断路 V(2)=V(3)=10；R3 断路后节点 3 悬浮，无唯一解
+TCIR = 'V1 1 0 10\nR1 1 2 5\nR2 2 0 5\nR3 2 3 8'
+
+
+def diag_text(text, measurements):
+    elements, nodes = parse_netlist(text)
+    return diagnose_open(elements, nodes, measurements)
+
+
+def hypo_by_name(result):
+    return {h['name']: h for h in result['hypotheses']}
+
+
+# 实测与正常电路一致：仅「正常电路」匹配；R3 断路无唯一解被单列
+r = diag_text(TCIR, [{'node': 2, 'voltage': 5.0, 'tolerance': 0.1}])
+d = hypo_by_name(r)
+check(len(r['hypotheses']) == 3 and len(r['unsolvable']) == 1,
+      '断路定位：可求解假设与无唯一解假设数量')
+check(d['正常电路']['matched'] and close(d['正常电路']['score'], 0),
+      '断路定位：实测符合正常电路（得分 0）')
+check(not d['R1']['matched'] and close(d['R1']['score'], 50)
+      and not d['R2']['matched'] and close(d['R2']['score'], 50),
+      '断路定位：R1/R2 断路预测偏离实测（得分 50）')
+check(r['unsolvable'][0]['name'] == 'R3'
+      and '悬浮' in r['unsolvable'][0]['reason'],
+      '断路定位：R3 断路后节点悬浮，单列原因')
+
+# 预测值与带符号误差（预测 − 实测）
+pred = d['R1']['predictions'][0]
+check(pred['node'] == 2 and close(pred['predicted'], 0)
+      and close(pred['measured'], 5) and close(pred['tolerance'], 0.1)
+      and close(pred['error'], -5),
+      '断路定位：预测值、实测回显与带符号误差（预测 − 实测）')
+
+# R1 断路被唯一定位（两个测点）
+r = diag_text(TCIR, [{'node': 2, 'voltage': 0.0, 'tolerance': 0.1},
+                     {'node': 3, 'voltage': 0.0, 'tolerance': 0.1}])
+matched = [h['name'] for h in r['hypotheses'] if h['matched']]
+check(matched == ['R1'] and close(hypo_by_name(r)['R1']['score'], 0),
+      '断路定位：R1 断路被唯一定位')
+
+# R2 断路被唯一定位
+r = diag_text(TCIR, [{'node': 2, 'voltage': 10.0, 'tolerance': 0.1}])
+matched = [h['name'] for h in r['hypotheses'] if h['matched']]
+check(matched == ['R2'], '断路定位：R2 断路被唯一定位')
+
+# 容差放宽后多个假设同时匹配（无法区分）
+r = diag_text(TCIR, [{'node': 2, 'voltage': 5.0, 'tolerance': 10.0}])
+matched = [h['name'] for h in r['hypotheses'] if h['matched']]
+check(matched == ['正常电路', 'R1', 'R2'],
+      '断路定位：容差放宽后多个假设匹配（无法区分）')
+check([h['name'] for h in r['hypotheses']] == ['正常电路', 'R1', 'R2'],
+      '断路定位：结果按得分再按假设名称排序')
+
+# 没有假设匹配：不符合单断路模型
+r = diag_text(TCIR, [{'node': 2, 'voltage': 3.0, 'tolerance': 0.1}])
+check(all(not h['matched'] for h in r['hypotheses']),
+      '断路定位：无匹配假设（不符合单断路模型）')
+
+# 得分恰为 1 仍视为匹配
+r = diag_text(TCIR, [{'node': 2, 'voltage': 4.0, 'tolerance': 1.0}])
+d = hypo_by_name(r)
+check(close(d['正常电路']['score'], 1) and d['正常电路']['matched'],
+      '断路定位：得分 ≤ 1 边界仍匹配')
+
+# 分析不改写网表：诊断前后元件列表与求解结果一致
+elements, nodes = parse_netlist(TCIR)
+before = solve_circuit(elements, nodes)
+diagnose_open(elements, nodes, [{'node': 2, 'voltage': 5.0, 'tolerance': 0.1}])
+after = solve_circuit(elements, nodes)
+check(len(elements) == 4 and before == after, '断路定位：分析不改写网表')
+
+
+def expect_diag_error(text, measurements, exc_type, keyword, label):
+    try:
+        diag_text(text, measurements)
+    except exc_type as exc:
+        check(keyword in str(exc), f'{label}（提示包含「{keyword}」）-> {exc}')
+        return
+    except Exception as exc:  # noqa: BLE001
+        check(False, f'{label}（抛出了错误类型 {type(exc).__name__}: {exc}）')
+        return
+    check(False, f'{label}（未抛出 {exc_type.__name__}）')
+
+
+m = lambda node, v, tol: {'node': node, 'voltage': v, 'tolerance': tol}  # noqa: E731
+expect_diag_error(TCIR, [], NetlistError, '1～12', '断路定位：测点数量为 0')
+expect_diag_error(TCIR, [m(1, 0, 1)] * 13, NetlistError, '1～12',
+                  '断路定位：测点数量超过 12')
+expect_diag_error(TCIR, [m(0, 0, 1)], NetlistError, '接地', '断路定位：测点为接地节点')
+expect_diag_error(TCIR, [m(9, 0, 1)], NetlistError, '不存在', '断路定位：测点节点不存在')
+expect_diag_error(TCIR, [m(2, 0, 1), m(2, 1, 1)], NetlistError, '重复',
+                  '断路定位：测点节点重复')
+expect_diag_error(TCIR, [m(2, float('nan'), 1)], NetlistError, '有限',
+                  '断路定位：实测电压 NaN')
+expect_diag_error(TCIR, [m(2, float('inf'), 1)], NetlistError, '有限',
+                  '断路定位：实测电压无穷')
+expect_diag_error(TCIR, [m(2, 0, 0)], NetlistError, '正的有限', '断路定位：零容差')
+expect_diag_error(TCIR, [m(2, 0, -1)], NetlistError, '正的有限', '断路定位：负容差')
+expect_diag_error(TCIR, [m(2, 0, float('nan'))], NetlistError, '正的有限',
+                  '断路定位：NaN 容差')
+
+# 正常电路本身无唯一解时直接报错
+expect_diag_error('I1 1 0 1', [m(1, 1, 0.1)], NoUniqueSolutionError, '悬浮',
+                  '断路定位：正常电路无唯一解')
 
 print(f'\n通过 {PASSED} 项，失败 {FAILED} 项')
 sys.exit(1 if FAILED else 0)

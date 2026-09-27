@@ -495,3 +495,98 @@ def compute_thevenin(elements: list[Element], nodes: list[int],
         'il': il, 'il_unit': 'A',
         'pl': pl, 'pl_unit': 'W',
     }
+
+
+def diagnose_open(elements: list[Element], nodes: list[int],
+                  measurements: list[dict]) -> dict:
+    """单电阻断路定位：枚举「正常电路」与「每个电阻单独断路」的假设并评分。
+
+    measurements 为 1～12 条实测数据，每项含：
+        node      非接地节点编号（须在网表中存在，各测点不得重复）
+        voltage   实测电压（有限值，单位 V）
+        tolerance 绝对容差（正的有限值，单位 V）
+
+    断路假设通过从元件列表中**删除该电阻支路**、保留原节点集合重新组装
+    MNA 来建模（不使用大电阻近似）。正常电路必须有唯一解，否则
+    NoUniqueSolutionError 直接抛给调用方；断路后无唯一解的假设记入
+    unsolvable 并继续检查其余假设。本函数不修改传入的元件列表。
+
+    每个可求解假设的得分为各测点 |预测 − 实测| ÷ 容差 的最大值，
+    得分 ≤ 1 视为与实测数据匹配。
+
+    返回 {'measurements', 'hypotheses', 'unsolvable'}：
+    hypotheses 已按 (得分, 假设名称) 升序排列，每项含各测点预测值、
+    带符号误差（预测 − 实测）、得分与是否匹配；unsolvable 每项含
+    断路电阻名称与无唯一解的原因。
+    """
+    if not 1 <= len(measurements) <= MAX_NODES:
+        raise NetlistError(
+            f'测点数量为 {len(measurements)} 个，应在 1～{MAX_NODES} 之间')
+
+    seen_nodes = set()
+    for i, m in enumerate(measurements, 1):
+        node = m['node']
+        if node == GROUND:
+            raise NetlistError(
+                f'第 {i} 条测点：节点 0 为接地节点，电压恒为 0，'
+                '请测量非接地节点')
+        if not math.isfinite(m['voltage']):
+            raise NetlistError(
+                f'第 {i} 条测点：实测电压必须为有限值'
+                f'（当前为 {m["voltage"]}，单位 V）')
+        if not math.isfinite(m['tolerance']) or m['tolerance'] <= 0:
+            raise NetlistError(
+                f'第 {i} 条测点：绝对容差必须为正的有限值'
+                f'（当前为 {m["tolerance"]}，单位 V）')
+        if node in seen_nodes:
+            raise NetlistError(f'第 {i} 条测点：节点 {node} 与前面的测点重复')
+        seen_nodes.add(node)
+        if node not in nodes:
+            raise NetlistError(
+                f'第 {i} 条测点：节点 {node} 不存在：当前网表的非接地节点为 '
+                f'{"、".join(map(str, nodes))}')
+
+    def evaluate(name, kind, hypo_elements):
+        x, _, index, _ = _solve_mna(hypo_elements, nodes)
+        predictions = []
+        score = 0.0
+        for m in measurements:
+            predicted = x[index[m['node']]]
+            error = predicted - m['voltage']
+            predictions.append({
+                'node': m['node'],
+                'measured': m['voltage'],
+                'tolerance': m['tolerance'],
+                'predicted': predicted,
+                'error': error,
+            })
+            score = max(score, abs(error) / m['tolerance'])
+        return {
+            'name': name,
+            'kind': kind,
+            'predictions': predictions,
+            'score': score,
+            'matched': score <= 1.0,
+        }
+
+    # 正常电路必须有唯一解（不满足时异常直接抛给调用方）
+    hypotheses = [evaluate('正常电路', 'normal', elements)]
+    unsolvable = []
+    for r in elements:
+        if r.kind != 'R':
+            continue
+        # 删除该电阻支路，保留原节点集合重新组装 MNA
+        hypo_elements = [e for e in elements if e is not r]
+        try:
+            hypotheses.append(evaluate(r.name, 'open', hypo_elements))
+        except NoUniqueSolutionError as exc:
+            unsolvable.append({'name': r.name, 'reason': str(exc)})
+
+    hypotheses.sort(key=lambda h: (h['score'], h['name']))
+    return {
+        'measurements': [
+            {'node': m['node'], 'voltage': m['voltage'],
+             'tolerance': m['tolerance']} for m in measurements],
+        'hypotheses': hypotheses,
+        'unsolvable': unsolvable,
+    }

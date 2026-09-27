@@ -1,4 +1,4 @@
-"""Flask 入口：提供页面与 /solve、/sensitivity、/thevenin 接口。"""
+"""Flask 入口：提供页面与 /solve、/sensitivity、/thevenin、/diagnose-open 接口。"""
 
 import math
 
@@ -6,6 +6,7 @@ from flask import Flask, jsonify, render_template, request
 
 from solver import (NetlistError, NoUniqueSolutionError, compute_sensitivity,
                     compute_thevenin, parse_netlist, solve_circuit)
+from solver import diagnose_open as diagnose_single_open
 
 app = Flask(__name__)
 
@@ -127,6 +128,75 @@ def thevenin():
     except (NetlistError, NoUniqueSolutionError) as exc:
         return jsonify(ok=False, error=str(exc))
     return jsonify(ok=True, thevenin=result)
+
+
+def _parse_measurements(payload: dict) -> list[dict]:
+    """从请求体提取实测电压列表，返回 [{'node', 'voltage', 'tolerance'}]。"""
+    raw = payload.get('measurements')
+    if not isinstance(raw, list):
+        raise NetlistError(
+            '请求格式错误：measurements 必须是数组，每项形如 '
+            '{"node": 2, "voltage": 5.0, "tolerance": 0.1}')
+    if not 1 <= len(raw) <= 12:
+        raise NetlistError(f'测点数量为 {len(raw)} 个，应在 1～12 之间')
+
+    def _number(item: dict, key: str, label: str, i: int) -> float:
+        raw_value = item.get(key)
+        if isinstance(raw_value, bool):
+            raise NetlistError(f'第 {i} 条测点{label}非法，应为数值（单位 V）')
+        try:
+            return float(str(raw_value).strip())
+        except (ValueError, TypeError):
+            raise NetlistError(
+                f'第 {i} 条测点{label} "{raw_value}" 不是合法的数值，'
+                '应为有限数值（单位 V）') from None
+
+    measurements = []
+    for i, item in enumerate(raw, 1):
+        if not isinstance(item, dict):
+            raise NetlistError(
+                f'第 {i} 条测点格式错误：应为对象，形如 '
+                '{"node": 2, "voltage": 5.0, "tolerance": 0.1}')
+        raw_node = item.get('node')
+        if isinstance(raw_node, bool):
+            raise NetlistError(
+                f'第 {i} 条测点节点编号非法，应为正整数（非接地节点）')
+        try:
+            node = int(str(raw_node).strip(), 10)
+        except (ValueError, TypeError):
+            raise NetlistError(
+                f'第 {i} 条测点节点编号 "{raw_node}" 非法，'
+                '应为正整数（非接地节点）') from None
+        if node <= 0:
+            raise NetlistError(
+                f'第 {i} 条测点节点编号 {node} 非法：测点必须是非接地节点'
+                '（节点 0 电压恒为 0）')
+        voltage = _number(item, 'voltage', '实测电压', i)
+        if not math.isfinite(voltage):
+            raise NetlistError(
+                f'第 {i} 条测点实测电压必须为有限值（单位 V）')
+        tolerance = _number(item, 'tolerance', '绝对容差', i)
+        if not math.isfinite(tolerance) or tolerance <= 0:
+            raise NetlistError(
+                f'第 {i} 条测点绝对容差必须为正的有限值（单位 V）')
+        measurements.append(
+            {'node': node, 'voltage': voltage, 'tolerance': tolerance})
+    return measurements
+
+
+@app.post('/diagnose-open')
+def diagnose_open():
+    payload = request.get_json(silent=True) or {}
+    text = payload.get('netlist', '')
+    if not isinstance(text, str):
+        return jsonify(ok=False, error='请求格式错误：netlist 必须是字符串'), 400
+    try:
+        elements, nodes = parse_netlist(text)
+        measurements = _parse_measurements(payload)
+        result = diagnose_single_open(elements, nodes, measurements)
+    except (NetlistError, NoUniqueSolutionError) as exc:
+        return jsonify(ok=False, error=str(exc))
+    return jsonify(ok=True, **result)
 
 
 if __name__ == '__main__':

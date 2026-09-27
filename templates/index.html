@@ -109,6 +109,42 @@
         </table>
       </div>
     </section>
+
+    <section id="diagnose">
+      <h2>单电阻断路定位</h2>
+      <p class="hint">
+        为当前网表输入 <strong>1～12 条</strong>实测数据：每条为一个<strong>非接地节点</strong>
+        （不得重复）的实测电压（有限值，V）与<strong>正的有限</strong>绝对容差（V）。
+        系统枚举「正常电路」与「每个电阻单独断路」的假设——断路即<strong>删除该支路</strong>、
+        保留原节点集合重新组装 MNA（不用大电阻近似）；正常电路须有唯一解，
+        断路后无唯一解的假设单独列出原因。每个可求解假设给出各测点预测值与
+        带符号误差（预测 − 实测），得分为各点 <strong>|误差| ÷ 容差</strong> 的最大值，
+        <strong>得分 ≤ 1 视为匹配</strong>，结果按得分再按假设名称排序：
+        仅一个匹配时指出正常或断路元件，多个匹配时提示无法区分，
+        没有匹配时说明不符合单断路模型。
+      </p>
+      <div id="meas-rows"></div>
+      <div class="toolbar">
+        <button id="meas-add-btn" type="button">添加测点</button>
+        <button id="diag-btn" class="primary">诊断断路</button>
+      </div>
+      <div id="diag-output" hidden>
+        <p id="diag-summary" class="summary"></p>
+        <table id="diag-table">
+          <thead>
+            <tr>
+              <th>假设</th><th>得分</th><th>判定</th>
+              <th>各测点预测值（带符号误差）</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div id="diag-unsolvable" hidden>
+          <p class="label">断路后无唯一解的假设（未参与评分）</p>
+          <ul id="diag-unsolvable-list"></ul>
+        </div>
+      </div>
+    </section>
   </main>
 
   <script src="{{ url_for('static', filename='app.js') }}"></script>

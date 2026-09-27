@@ -37,6 +37,14 @@ const thBtn = document.getElementById('th-btn');
 const thOutputEl = document.getElementById('th-output');
 const thSummaryEl = document.getElementById('th-summary');
 const thTbody = document.querySelector('#th-table tbody');
+const measRowsEl = document.getElementById('meas-rows');
+const measAddBtn = document.getElementById('meas-add-btn');
+const diagBtn = document.getElementById('diag-btn');
+const diagOutputEl = document.getElementById('diag-output');
+const diagSummaryEl = document.getElementById('diag-summary');
+const diagTbody = document.querySelector('#diag-table tbody');
+const diagUnsolvableEl = document.getElementById('diag-unsolvable');
+const diagUnsolvableListEl = document.getElementById('diag-unsolvable-list');
 
 // 数值格式化：去掉无意义的尾零，极大/极小值用科学计数法
 function fmt(x) {
@@ -60,6 +68,7 @@ function showError(message) {
   resultsEl.hidden = true;
   sensOutputEl.hidden = true;
   thOutputEl.hidden = true;
+  diagOutputEl.hidden = true;
 }
 
 function clearError() {
@@ -147,6 +156,7 @@ clearBtn.addEventListener('click', () => {
   resultsEl.hidden = true;
   sensOutputEl.hidden = true;
   thOutputEl.hidden = true;
+  diagOutputEl.hidden = true;
   netlistEl.focus();
 });
 netlistEl.addEventListener('keydown', (e) => {
@@ -319,3 +329,172 @@ for (const el of [thNode1El, thNode2El, thLoadEl]) {
     if (e.key === 'Enter') thevenin();
   });
 }
+
+// ---------- 单电阻断路定位 ----------
+
+const MAX_MEAS = 12;
+
+function updateMeasButtons() {
+  const rows = measRowsEl.querySelectorAll('.meas-row');
+  measAddBtn.disabled = rows.length >= MAX_MEAS;
+  for (const row of rows) {
+    row.querySelector('.meas-remove').disabled = rows.length <= 1;
+  }
+}
+
+function addMeasRow() {
+  const row = document.createElement('div');
+  row.className = 'meas-row';
+  const fields = [
+    ['节点', 'meas-node', '如 2', 'numeric', 4],
+    ['实测电压 (V)', 'meas-voltage', '如 5', 'decimal', 8],
+    ['容差 (V)', 'meas-tol', '如 0.1', 'decimal', 6],
+  ];
+  for (const [labelText, cls, placeholder, inputmode, size] of fields) {
+    const label = document.createElement('label');
+    label.textContent = labelText;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = cls;
+    input.inputMode = inputmode;
+    input.size = size;
+    input.placeholder = placeholder;
+    input.autocomplete = 'off';
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') diagnose();
+    });
+    label.appendChild(input);
+    row.appendChild(label);
+  }
+  const removeBtn = document.createElement('button');
+  removeBtn.type = 'button';
+  removeBtn.className = 'meas-remove';
+  removeBtn.textContent = '删除';
+  removeBtn.addEventListener('click', () => {
+    row.remove();
+    updateMeasButtons();
+  });
+  row.appendChild(removeBtn);
+  measRowsEl.appendChild(row);
+  updateMeasButtons();
+}
+
+function hypothesisLabel(h) {
+  return h.kind === 'normal' ? '正常电路' : `${h.name} 断路`;
+}
+
+function renderDiagnose(data) {
+  diagTbody.textContent = '';
+  const matches = data.hypotheses.filter((h) => h.matched);
+
+  let conclusion;
+  if (matches.length === 1) {
+    conclusion = matches[0].kind === 'normal'
+      ? '诊断结论：仅「正常电路」与实测数据相符（得分 ≤ 1），未发现单电阻断路。'
+      : `诊断结论：仅「${matches[0].name} 断路」与实测数据相符（得分 ≤ 1），` +
+        `定位到断路元件：${matches[0].name}。`;
+  } else if (matches.length > 1) {
+    conclusion =
+      `诊断结论：${matches.length} 个假设与实测数据相符（得分 ≤ 1）：` +
+      `${matches.map(hypothesisLabel).join('、')}。` +
+      '现有测量无法区分，请增加测点或收紧容差。';
+  } else {
+    conclusion =
+      '诊断结论：没有任何假设与实测数据相符（得分均 > 1），' +
+      '实测数据不符合单电阻断路模型（可能存在多个故障或其他原因）。';
+  }
+  const total = data.hypotheses.length + data.unsolvable.length;
+  diagSummaryEl.textContent =
+    `${conclusion} 共枚举 ${total} 个假设（正常电路 + ${total - 1} 个电阻断路），` +
+    `其中 ${data.unsolvable.length} 个断路后无唯一解。`;
+
+  for (const h of data.hypotheses) {
+    const tr = document.createElement('tr');
+
+    const tdName = document.createElement('td');
+    tdName.textContent = hypothesisLabel(h);
+    tr.appendChild(tdName);
+
+    const tdScore = document.createElement('td');
+    tdScore.textContent = fmt(h.score);
+    tdScore.className = 'num';
+    tr.appendChild(tdScore);
+
+    const tdJudge = document.createElement('td');
+    tdJudge.textContent = h.matched ? '匹配' : '不匹配';
+    tdJudge.classList.add(h.matched ? 'pos' : 'neg');
+    tr.appendChild(tdJudge);
+
+    const tdPred = document.createElement('td');
+    for (const p of h.predictions) {
+      const div = document.createElement('div');
+      div.textContent =
+        `节点 ${p.node}：预测 ${fmt(p.predicted)} V，` +
+        `误差 ${fmtSigned(p.error)} V（实测 ${fmt(p.measured)} ± ${fmt(p.tolerance)}）`;
+      tdPred.appendChild(div);
+    }
+    tr.appendChild(tdPred);
+
+    diagTbody.appendChild(tr);
+  }
+
+  diagUnsolvableListEl.textContent = '';
+  if (data.unsolvable.length) {
+    for (const u of data.unsolvable) {
+      const li = document.createElement('li');
+      li.textContent = `${u.name} 断路：${u.reason}`;
+      diagUnsolvableListEl.appendChild(li);
+    }
+    diagUnsolvableEl.hidden = false;
+  } else {
+    diagUnsolvableEl.hidden = true;
+  }
+
+  diagOutputEl.hidden = false;
+}
+
+async function diagnose() {
+  clearError();
+  const rows = [...measRowsEl.querySelectorAll('.meas-row')];
+  const measurements = [];
+  for (const row of rows) {
+    const node = row.querySelector('.meas-node').value.trim();
+    const voltage = row.querySelector('.meas-voltage').value.trim();
+    const tolerance = row.querySelector('.meas-tol').value.trim();
+    if (!node || !voltage || !tolerance) {
+      showError('请完整填写每个测点的节点编号、实测电压与容差（或删除多余的测点行）');
+      return;
+    }
+    measurements.push({ node, voltage, tolerance });
+  }
+
+  diagBtn.disabled = true;
+  try {
+    const resp = await fetch('/diagnose-open', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ netlist: netlistEl.value, measurements }),
+    });
+    let data;
+    try {
+      data = await resp.json();
+    } catch {
+      showError(`服务器返回异常（HTTP ${resp.status}）`);
+      return;
+    }
+    // 出错时仅提示原因，网表与全部测点输入均保留
+    if (!data.ok) {
+      showError(data.error || '断路诊断失败');
+      return;
+    }
+    renderDiagnose(data);
+  } catch {
+    showError('无法连接服务器，请检查服务是否正常运行');
+  } finally {
+    diagBtn.disabled = false;
+  }
+}
+
+measAddBtn.addEventListener('click', addMeasRow);
+diagBtn.addEventListener('click', diagnose);
+addMeasRow();
